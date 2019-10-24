@@ -172,25 +172,26 @@ def compute_average_flops_cost(self, bw_weight=4, bw_act=4, strategy=(None, None
     for name, module in self.named_modules():
         if is_supported_instance(module):
             if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+                flops_sum += module.__flops__[1] # taking into account the additions count
                 if isinstance(w_str, list):
-                    mod_flops = module.__flops__*max(w_str[quant_idx], a_str[quant_idx])/32.0
+                    mod_flops = module.__flops__[0]*max(w_str[quant_idx], a_str[quant_idx])/32.0
                     flops_sum += mod_flops
                     quant_idx += 1
                 elif isinstance(w_str, dict):
                     if name in w_str:
-                        mod_flops = module.__flops__*max(w_str[name], w_str[name])/32.0 # assuming bitwidth weight=act
+                        mod_flops = module.__flops__[0]*max(w_str[name], w_str[name])/32.0 # assuming bitwidth weight=act
                     else:
-                        mod_flops = module.__flops__*max(bw_weight, bw_act)/32.0
+                        mod_flops = module.__flops__[0]*max(bw_weight, bw_act)/32.0
                     flops_sum += mod_flops
                 else:
-                    mod_flops = module.__flops__*max(bw_weight, bw_act)/32.0
+                    mod_flops = module.__flops__[0]*max(bw_weight, bw_act)/32.0
                     flops_sum += mod_flops
             else:
                 mod_flops = module.__flops__
                 flops_sum += mod_flops
 
             if print_layerwise:
-                print(name, mod_flops)
+                print(name, flops_sum)
 
     return flops_sum / batches_count
 
@@ -283,8 +284,7 @@ def linear_flops_counter_hook(module, input, output):
     batch_size = input.shape[0]
     nonzero_fraction = module.weight.data.ne(0).float().sum().item()/(input.shape[1] * output.shape[1])
     n_elements = input.shape[1] * nonzero_fraction
-    module.__flops__ += int(batch_size * n_elements * output.shape[1])
-    module.__flops__ += int(batch_size * (n_elements-1) * output.shape[1])
+    module.__flops__ = (int(batch_size * n_elements * output.shape[1]), int(batch_size * (n_elements-1) * output.shape[1]))
 
 
 def pool_flops_counter_hook(module, input, output):
@@ -343,8 +343,8 @@ def conv_flops_counter_hook(conv_module, input, output):
     nonzero_fraction = conv_module.weight.data.ne(0).float().sum().item()/(np.prod(kernel_dims) * in_channels * filters_per_channel)
 
     vector_length = np.prod(kernel_dims) * in_channels * nonzero_fraction
-    conv_per_position_flops = vector_length * filters_per_channel
-    conv_per_position_flops += (vector_length - 1) * filters_per_channel # number of additions
+    conv_per_position_mul_flops = vector_length * filters_per_channel
+    conv_per_position_add_flops = (vector_length - 1) * filters_per_channel # number of additions
 
     active_elements_count = batch_size * np.prod(output_dims)
 
@@ -353,7 +353,8 @@ def conv_flops_counter_hook(conv_module, input, output):
         flops_mask = conv_module.__mask__.expand(batch_size, 1, output_height, output_width)
         active_elements_count = flops_mask.sum()
 
-    overall_conv_flops = conv_per_position_flops * active_elements_count
+    overall_conv_mul_flops = conv_per_position_mul_flops * active_elements_count
+    overall_conv_add_flops = conv_per_position_add_flops * active_elements_count
 
     bias_flops = 0
 
@@ -361,9 +362,9 @@ def conv_flops_counter_hook(conv_module, input, output):
 
         bias_flops = out_channels * active_elements_count
 
-    overall_flops = overall_conv_flops + bias_flops
+    overall_conv_add_flops = overall_conv_add_flops + bias_flops
 
-    conv_module.__flops__ += int(overall_flops)
+    conv_module.__flops__ = (int(overall_conv_mul_flops), int(overall_conv_add_flops))
 
 
 def batch_counter_hook(module, input, output):
